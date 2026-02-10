@@ -1,0 +1,5 @@
+#!/bin/bash
+# Arch R - Set maximum performance for gaming
+echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
+echo performance > /sys/devices/platform/ff400000.gpu/devfreq/ff400000.gpu/governor 2>/dev/null
+echo performance > /sys/devices/platform/dmc/devfreq/dmc/governor 2>/dev/null

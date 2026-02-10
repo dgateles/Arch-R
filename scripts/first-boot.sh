@@ -3,12 +3,15 @@
 #==============================================================================
 # Arch R - First Boot Setup Script
 #==============================================================================
-# Runs on first boot to configure the system
+# Runs on first boot to:
+# 1. Create ROMS partition (FAT32) with remaining SD card space
+# 2. Generate SSH keys and machine-id
+# 3. Configure RetroArch and EmulationStation
+# 4. Create ROM directories
 #==============================================================================
 
 FIRST_BOOT_FLAG="/var/lib/archr/.first-boot-done"
 
-# Check if already ran
 if [ -f "$FIRST_BOOT_FLAG" ]; then
     exit 0
 fi
@@ -16,28 +19,69 @@ fi
 echo "=== Arch R First Boot Setup ==="
 
 #------------------------------------------------------------------------------
-# Resize partition to fill SD card
+# Detect SD card device
 #------------------------------------------------------------------------------
-echo "Resizing root partition..."
+ROOT_SOURCE=$(findmnt -no SOURCE /)
+ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SOURCE" | head -1)
+ROOT_DISK="/dev/${ROOT_DISK}"
 
-ROOT_DEV="/dev/mmcblk0p2"
-ROOT_DISK="/dev/mmcblk0"
+echo "Root device: $ROOT_SOURCE"
+echo "SD card: $ROOT_DISK"
 
-# Get current end and max available
-PART_INFO=$(parted -m "$ROOT_DISK" unit s print 2>/dev/null | grep "^2:")
-CURRENT_END=$(echo "$PART_INFO" | cut -d: -f3 | tr -d 's')
+#------------------------------------------------------------------------------
+# Create ROMS partition (partition 3) if it doesn't exist
+#------------------------------------------------------------------------------
+ROMS_PART="${ROOT_DISK}p3"
 
-DISK_SIZE=$(parted -m "$ROOT_DISK" unit s print 2>/dev/null | grep "^$ROOT_DISK" | cut -d: -f2 | tr -d 's')
-MAX_END=$((DISK_SIZE - 34))  # Leave space for GPT backup
+if ! lsblk "$ROMS_PART" &>/dev/null; then
+    echo "Creating ROMS partition..."
+    echo ",,0c" | sfdisk --append "$ROOT_DISK" 2>/dev/null
+    partprobe "$ROOT_DISK"
+    sleep 2
 
-if [ "$CURRENT_END" -lt "$MAX_END" ]; then
-    echo "  Expanding partition..."
-    parted -s "$ROOT_DISK" resizepart 2 100%
-    resize2fs "$ROOT_DEV"
-    echo "  Partition expanded!"
+    if lsblk "$ROMS_PART" &>/dev/null; then
+        echo "  Formatting as FAT32..."
+        mkfs.vfat -F 32 -n ROMS "$ROMS_PART"
+        echo "  ROMS partition created!"
+    else
+        echo "  WARNING: Failed to create ROMS partition"
+    fi
 else
-    echo "  Partition already at maximum size"
+    echo "  ROMS partition already exists"
 fi
+
+#------------------------------------------------------------------------------
+# Mount ROMS partition and create directories
+#------------------------------------------------------------------------------
+echo "Setting up ROM directories..."
+
+mkdir -p /roms
+
+if lsblk "$ROMS_PART" &>/dev/null; then
+    mount "$ROMS_PART" /roms 2>/dev/null || true
+fi
+
+SYSTEMS=(
+    "nes" "snes" "gb" "gbc" "gba" "nds"
+    "megadrive" "mastersystem" "gamegear" "genesis" "segacd" "sega32x"
+    "n64" "psx" "psp"
+    "dreamcast" "saturn"
+    "arcade" "mame" "fbneo" "neogeo"
+    "atari2600" "atari7800" "atarilynx"
+    "pcengine" "pcenginecd"
+    "wonderswan" "wonderswancolor"
+    "ngp" "ngpc"
+    "virtualboy"
+    "scummvm" "dos"
+    "ports"
+    "bios"
+)
+
+for sys in "${SYSTEMS[@]}"; do
+    mkdir -p "/roms/$sys"
+done
+
+echo "  ROM directories created"
 
 #------------------------------------------------------------------------------
 # Generate SSH host keys
@@ -57,38 +101,41 @@ systemd-machine-id-setup
 #------------------------------------------------------------------------------
 echo "Enabling services..."
 systemctl enable NetworkManager 2>/dev/null || true
-systemctl enable bluetooth 2>/dev/null || true
 
 #------------------------------------------------------------------------------
 # Configure RetroArch
 #------------------------------------------------------------------------------
 echo "Configuring RetroArch..."
 
-RA_CONFIG="/home/archr/.config/retroarch/retroarch.cfg"
-mkdir -p "$(dirname "$RA_CONFIG")"
+RA_DIR="/home/archr/.config/retroarch"
+mkdir -p "$RA_DIR/cores"
+mkdir -p "$RA_DIR/saves"
+mkdir -p "$RA_DIR/states"
+mkdir -p "$RA_DIR/screenshots"
 
-if [ ! -f "$RA_CONFIG" ]; then
-    cp /etc/archr/retroarch.cfg "$RA_CONFIG" 2>/dev/null || true
+if [ ! -f "$RA_DIR/retroarch.cfg" ] && [ -f /etc/archr/retroarch.cfg ]; then
+    cp /etc/archr/retroarch.cfg "$RA_DIR/retroarch.cfg"
 fi
 
-chown -R archr:archr /home/archr/.config 2>/dev/null || true
+# Set savefile/savestate directories to per-system on ROMS partition
+sed -i "s|^savefile_directory =.*|savefile_directory = \"/roms/saves\"|" "$RA_DIR/retroarch.cfg" 2>/dev/null || true
+sed -i "s|^savestate_directory =.*|savestate_directory = \"/roms/states\"|" "$RA_DIR/retroarch.cfg" 2>/dev/null || true
+mkdir -p /roms/saves /roms/states
 
 #------------------------------------------------------------------------------
-# Create ROM directories
+# Configure EmulationStation
 #------------------------------------------------------------------------------
-echo "Creating ROM directories..."
+echo "Configuring EmulationStation..."
 
-ROM_BASE="/home/archr/roms"
-SYSTEMS=(
-    "gb" "gbc" "gba" "nes" "snes" "megadrive" "psx"
-    "n64" "psp" "dreamcast" "arcade" "mame"
-)
+ES_DIR="/home/archr/.emulationstation"
+mkdir -p "$ES_DIR"
 
-for sys in "${SYSTEMS[@]}"; do
-    mkdir -p "$ROM_BASE/$sys"
-done
+# Link system config
+if [ ! -f "$ES_DIR/es_systems.cfg" ] && [ -f /etc/emulationstation/es_systems.cfg ]; then
+    ln -sf /etc/emulationstation/es_systems.cfg "$ES_DIR/es_systems.cfg"
+fi
 
-chown -R archr:archr "$ROM_BASE"
+chown -R archr:archr /home/archr
 
 #------------------------------------------------------------------------------
 # Mark first boot complete
@@ -97,5 +144,3 @@ mkdir -p "$(dirname "$FIRST_BOOT_FLAG")"
 touch "$FIRST_BOOT_FLAG"
 
 echo "=== First Boot Setup Complete ==="
-echo ""
-echo "System will continue booting..."
