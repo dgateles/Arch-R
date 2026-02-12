@@ -4,8 +4,10 @@
 
 ## About
 
-Arch R is a custom Linux distribution optimized for the R36S handheld gaming console.
-Based on Arch Linux ARM with full support for RetroArch and EmulationStation.
+Arch R is a custom Linux distribution optimized for the R36S handheld gaming console and all its clones.
+Based on Arch Linux ARM with Kernel 6.6.89 (Rockchip BSP), Mesa Panfrost GPU, RetroArch, and EmulationStation.
+
+For detailed progress tracking and release timeline, see the **[ROADMAP](ROADMAP.md)**.
 
 ## Building
 
