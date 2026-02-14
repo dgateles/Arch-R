@@ -422,6 +422,74 @@ Created ROADMAP.md and linked from README.md.
 
 ---
 
+### 2026-02-13 — Day 10: Audio, Shutdown, Brightness — All Working
+
+*Session details captured in previous ROADMAP update and MEMORY.md.*
+
+Key achievements:
+- **Audio fully working:** Speaker output confirmed, volume hotkeys (DAC), headphone jack detection
+- **PMIC shutdown fixed:** systemd shutdown hook at `/usr/lib/systemd/system-shutdown/pmic-poweroff`
+- **Brightness working:** Direct sysfs backlight (max=255), chmod 666 fix, MODE+VOL hotkeys
+- **ES language crash fixed:** Patch 6 — `quitES(RESTART)` instead of in-place `delete/new GuiMenu`
+
+---
+
+### 2026-02-14 — Day 11: CPU 1512MHz Unlocked & Mesa 26 Built
+
+Two major milestones today:
+
+**CPU Frequency: 1200MHz → 1512MHz — UNLOCKED**
+
+Previous approach (deleting all scaling properties from cpu0_opp_table) caused **black screen**
+on every boot — tested 3 different variants, all failed. Deep analysis of `rockchip_opp_select.c`
+and `rockchip_system_monitor.c` revealed two root causes:
+
+1. Without pvtm properties, `volt_sel=-EINVAL` → wrong opp-microvolt variant selection
+2. Without `rockchip,max-volt`, system monitor's low-temp voltage is unclamped
+   (1350mV + 50mV = 1400mV > vdd_arm regulator max 1350mV)
+
+**Breakthrough:** Decompiled dArkOS R36S-V20 DTB and discovered they use a completely
+different approach — keep ALL scaling properties intact, just add `rockchip,avs = <1>`:
+
+- Default `avs=0` = `AVS_DELETE_OPP` → the OPP deletion path is **always active**
+- `avs=1` = `AVS_SCALING_RATE` → uses lenient `avs_scale(4)` check
+- `opp_scale` for 1512MHz >> `avs_scale(4)` → exits early → **no OPPs disabled**
+
+**ONE line DTS change**, no property deletions:
+```dts
+&cpu0_opp_table {
+    rockchip,avs = <1>;
+};
+```
+
+Confirmed working on hardware:
+```
+cpu cpu0: bin=2
+cpu cpu0: pvtm-volt-sel=0       ← PVTM selects L0 correctly
+cpu cpu0: avs=1                 ← AVS_SCALING_RATE active
+CPU freq: 1512000 kHz           ← Full 1.5GHz!
+CPU available: 408000 600000 816000 1008000 1200000 1248000 1296000 1416000 1512000
+GPU freq: 520000000 Hz          ← 520MHz GPU also confirmed
+```
+
+**Mesa 26.0.0 — Built Successfully**
+
+Created `build-mesa.sh` for native chroot build (QEMU aarch64). Key findings:
+- Mesa 26 architecture change: single `libgallium-26.0.0.so` megadriver (no `/usr/lib/dri/`)
+- GBM backend: `/usr/lib/gbm/dri_gbm.so`
+- Panfrost now requires LLVM (CLC for compute shaders) — added llvm, clang, libclc, spirv deps
+- Options removed in Mesa 26: `gallium-xa`, `gallium-vdpau`, `gallium-va`, `shared-glapi`
+- `video-codecs=all_free` (underscore, not hyphen)
+- Integrated into `build-all.sh` between rootfs and ES steps
+
+**Mesa 26 needs on-device testing** — deploy libs to SD card, verify ES still renders.
+
+**GPU target: 650MHz** — ARM specs for Mali-G31 list common operating frequencies of
+650-800MHz. Currently at 520MHz (from rk3326.dtsi). Next session: investigate whether
+RK3326 can drive Mali-G31 at 650MHz with appropriate vdd_logic voltage.
+
+---
+
 ## What's Left for v1.0 Stable
 
 ### Critical — Must Work Before Release
@@ -429,22 +497,22 @@ Created ROADMAP.md and linked from README.md.
 | # | Task | Status | Notes |
 |---|------|--------|-------|
 | 1 | ES rendering on screen | **WORKING** | gl4es + Panfrost confirmed, ES fast and stable |
-| 2 | Audio output | **Card registered** | rk817_int card + PCM devices created, needs volume/path test |
+| 2 | Audio output | **WORKING** | Speaker + volume hotkeys + headphone detection |
 | 3 | Game launch (RetroArch) | **BLOCKED** | ALARM's retroarch is Qt/XCB → needs KMSDRM custom build |
 | 4 | Button/joystick in ES | **WORKING** | gpio-keys (17 buttons) + adc-joystick (4 axes) |
 | 5 | Button/joystick in games | Not tested | Depends on RetroArch KMSDRM build |
-| 6 | Clean shutdown/reboot | **BROKEN** | systemd halts OK but PMIC doesn't cut power |
+| 6 | Clean shutdown/reboot | **WORKING** | systemd shutdown hook + PMIC I2C power-off |
 
 ### High Priority — Expected for Release
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 7 | Volume control (hotkeys) | **Fix ready** | Script fixed (DAC Playback Volume), needs deploy to SD |
-| 8 | Brightness control | **BROKEN** | sysfs values change but screen doesn't dim (PWM issue) |
-| 9 | Boot splash display | Not tested | BGRA raw → fb0 |
-| 10 | Panel selection (PanCho) | Not tested | 18 DTBOs generated, boot.ini integration |
-| 11 | Full build from scratch | Not tested | `build-all.sh` end-to-end |
-| 12 | ROMS partition auto-create | Tested manually | firstboot service integrated |
+| 7 | Volume control (hotkeys) | **WORKING** | DAC mixer + VOL+/VOL- hotkeys |
+| 8 | Brightness control | **WORKING** | Direct sysfs backlight (max=255), MODE+VOL hotkeys |
+| 9 | Mesa 26 on-device test | **Needs test** | Built, needs deploy to SD card |
+| 10 | GPU 650MHz unlock | **Needs research** | ARM Mali-G31 specs: 650-800MHz common |
+| 11 | Panel selection (PanCho) | Not tested | 18 DTBOs generated, boot.ini integration |
+| 12 | Full build from scratch | Not tested | `build-all.sh` end-to-end |
 
 ### Medium Priority — Can Ship Without, Fix in Updates
 
@@ -473,19 +541,22 @@ Created ROADMAP.md and linked from README.md.
 
 ## Path to v1.0
 
-**Current phase:** Audio validation + RetroArch KMSDRM build
+**Current phase:** Mesa 26 validation + GPU clock + RetroArch KMSDRM build
 
 1. ~~**Test gl4es + Panfrost rendering**~~ — **DONE.** ES renders on screen, Panfrost GPU confirmed
 2. ~~**Fix audio card registration**~~ — **DONE.** rk817_int card registered (3-iteration fix chain)
-3. **Deploy audio scripts + test speaker output** — sudo cp to ROOTFS, test `speaker-test`
-4. **Fix brightness** — PWM1 not changing screen, investigate driver/DTS/hardware
-5. **Build RetroArch with KMSDRM** — ALARM package uses Qt/XCB, needs custom build
-6. **Validate game launch** — RetroArch core loading, input in games
-7. **Fix shutdown** — PMIC power-off path without pinctrl (kernel panic with full pinctrl)
-8. **Full build test** — Run `build-all.sh` end-to-end on clean environment
-9. **Polish** — Boot splash, panel selection, ES language crash fix
-10. **Release candidate** — Generate final image, test on multiple R36S units
+3. ~~**Audio output + volume/brightness**~~ — **DONE.** Speaker, DAC hotkeys, brightness all working
+4. ~~**Fix shutdown**~~ — **DONE.** systemd shutdown hook + PMIC I2C power-off
+5. ~~**CPU 1512MHz unlock**~~ — **DONE.** `rockchip,avs = <1>` (dArkOS approach)
+6. ~~**Build Mesa 26**~~ — **DONE.** Panfrost + LLVM, megadriver architecture
+7. **Test Mesa 26 on device** — deploy libs to SD card, verify ES rendering
+8. **GPU 650MHz** — investigate Mali-G31 at 650MHz (ARM spec), vdd_logic voltage
+9. **Build RetroArch with KMSDRM** — ALARM package uses Qt/XCB, needs custom build
+10. **Validate game launch** — RetroArch core loading, input in games
+11. **Full build test** — Run `build-all.sh` end-to-end on clean environment
+12. **Polish** — Boot splash, panel selection
+13. **Release candidate** — Generate final image, test on multiple R36S units
 
 ---
 
-*Last updated: 2026-02-12*
+*Last updated: 2026-02-14*
