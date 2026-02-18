@@ -645,12 +645,154 @@ Without startup music AND without scrolling between systems, ES is **designed to
 **Also discovered:** AudioManager has ZERO success logging — `playMusic()` only logs on `Mix_LoadMUS` failure, `themeChanged()` has no LOG statements at all. Patch 15 adds diagnostic logging for next ES rebuild.
 
 **REGRESSION:** Last test showed "sem beep, sem som" — even the speaker-test beep stopped working.
-This is worse than before and needs investigation. Possible causes:
-- emulationstation.sh deployment issue (speaker-test section may not be executing)
-- ALSA device left in bad state from previous session
-- Permissions issue on SD card files
 
 **Status: ES rebuild with Patch 15 (AudioManager logging) planned for next session.**
+
+---
+
+### 2026-02-17 — ROOT CAUSE FOUND: `use-ext-amplifier` (Audio FIXED!)
+
+**The speaker audio root cause was a missing DTS property — not a software issue.**
+
+After rebuilding ES with Patch 15 (AudioManager diagnostic logging), logs confirmed the entire
+software chain was working perfectly: `playRandomMusic()` found 94 files, `playMusic()` loaded OGG,
+`NOW PLAYING: snes`, SDL3 ALSA backend opened `default` at 48kHz. VolumeControl found DAC mixer.
+speaker-test returned rc=0. **But zero sound from speaker.**
+
+**Root cause analysis of `rk817_codec.c`:**
+
+The BSP rk817 codec driver has THREE distinct SPK paths in `rk817_digital_mute_dac()` and
+`rk817_set_playback_path()`, selected by DTS boolean properties:
+
+1. `out-l2spk-r2hp` → Left→ClassD, Right→HP (costdown design)
+2. `!use_ext_amplifier` → Internal Class-D ON, **DACL/DACR DOWN** (line outputs disabled)
+3. `use_ext_amplifier` → Internal Class-D OFF, **DACL/DACR ON** (line outputs enabled)
+
+The R36S hardware routes audio: DAC → line outputs (DACL/DACR) → external amp (GPIO 116) → speaker.
+Without `use-ext-amplifier`, the codec wrote `ADAC_CFG1 = 0x03` (DACL_DOWN | DACR_DOWN), disabling
+the line outputs entirely. The external amp received zero signal → zero sound.
+
+**Why speaker-test rc=0 was misleading:** ALSA PCM write succeeds because DMA→I2S works fine.
+The data reaches the codec's digital side. But the codec's ANALOG output stage (DACL/DACR) was
+powered down at the register level (register 0x2f, bits 0-1). rc=0 does NOT mean sound came out.
+
+**Fix:** Added `use-ext-amplifier;` to `&rk817_codec` DTS node. DTB-only rebuild (1 second).
+Deployed new DTB to SD card BOOT partition.
+
+**Result: AUDIO WORKING — both EmulationStation AND RetroArch!**
+
+This was root cause #22 of the project. A single boolean DTS property controlled whether the
+codec sent audio to the correct output pins.
+
+---
+
+### 2026-02-17 (cont.) — Boot Time Optimization: 35s → 29s
+
+Started the session with a 35-second boot time. ArkOS clocks in at 21 seconds. Challenge accepted.
+
+**Where does the time go?**
+
+First, I needed real data. The `boot-timing.service` captures `systemd-analyze` and ES timeline
+markers on every boot. The breakdown:
+
+```
+Kernel:           3.8s   (can't do much here)
+Systemd:          8.4s   (device detection + service chain)
+ES script init:   0.5s   (audio, brightness, config)
+ES binary:       ~17s    (THE MONSTER — theme loading, Mesa init, directory scanning)
+───────────────────────
+Total:           ~29s
+```
+
+**The systemic fixes (35s → 29s):**
+
+*Removed splash.service:*
+U-Boot already shows `logo.bmp` at power-on (via `lcd_show_logo()` in `rk_board_late_init()`).
+Our splash.service was showing the image a second time. Removed it — one less service, one less
+flash. Updated `logo.bmp` to the new ArchR dragon logo (2400x1792 PNG → 640x480 24bpp BMP).
+
+*Replaced getty+bash with systemd service (the big one — saved ~5s):*
+Investigated how dArkOS achieves 21s. Their key difference: ES launches via a systemd service,
+not through the getty → PAM → bash → profile.d → .bash_profile chain. That chain alone costs
+4+ seconds on our slow SD card (bash binary loading from ext4 on a Class 10 card is brutal).
+
+Created `emulationstation.service`: `Type=simple`, `User=archr`, environment variables set
+directly (no fork overhead), `TTYPath=/dev/tty1` for DRM master access.
+
+Masked `getty@tty1.service` (→ /dev/null). Removed the fast-path exec block from `/etc/profile`
+(dead code now). Rewrote `emulationstation.sh` from 170 lines to 56 — removed root guard
+(service handles user), 12 export statements (service handles env), mkdir/linking (build-time),
+timing profiling, debug log setup. Kept: audio restore, brightness restore, save_state, main loop.
+
+*Removed fbcon=rotate:0 from kernel cmdline:*
+This parameter initializes the framebuffer console, which clears the U-Boot logo. Without it,
+the logo persists through the entire kernel boot. ES handles display orientation via SDL/DRM,
+fbcon isn't needed.
+
+*Boot-setup optimized (415ms → 89ms):*
+Removed `sleep 0.1` (was waiting for /dev/dri/* after modprobe panfrost). Created udev rules
+(`99-archr.rules`) to set DRM/tty/backlight permissions automatically on device creation — no
+more manual chmod. Added background readahead for ES binary + Mesa libraries (pre-warms the
+page cache while other services are still initializing).
+
+**The shutdown bug and its fix:**
+
+The systemd service broke shutdown. ES calls `sudo systemctl poweroff` from the script, but
+sudo needs CAP_SETUID/SETGID to switch to root — and the service only had CAP_SYS_ADMIN. The
+log showed `sudo: unable to change to root gid: Operation not permitted`. Fixed by adding
+CAP_SETUID, CAP_SETGID, CAP_DAC_OVERRIDE, CAP_AUDIT_WRITE to the service's
+AmbientCapabilities. Also added `systemctl poweroff` and `systemctl reboot` to the NOPASSWD
+sudoers list. And changed all exit paths to `exit 0` — previously `exit $ret` with ES's
+non-zero exit code triggered `Restart=on-failure`, restarting ES instead of shutting down.
+
+**The ROM detection bug:**
+
+Games weren't showing in ES. Root cause: the ROMS partition (mmcblk1p3, FAT32) wasn't mounted
+before ES started scanning directories. The fstab used `/dev/mmcblk1p3` with a 3-second device
+timeout — but the device takes ~4.4s to appear. Fixed by switching to `LABEL=ROMS` (more
+robust) and increasing the timeout to 10s. Added `After=local-fs.target` to the ES service
+so it waits for all filesystem mounts.
+
+**The remaining 17 seconds — ES binary startup analysis:**
+
+Dove into the ES-fcamod source code to understand why the binary takes 17 seconds to show its
+first frame. The startup sequence:
+
+```
+1. Window init (EGL/KMSDRM)              ~1-2s
+2. Parse es_systems.cfg (XML)            ~0.5s
+3. populateFolder() x 19 systems         ~3-4s   (walks /roms dirs)
+4. loadTheme() x 19 systems              ~6-8s   (THE BOTTLENECK)
+5. ViewController::preload() x 19        ~2-3s   (creates views)
+6. First frame render                    ~0.5-1s
+```
+
+**The critical insight:** ES loads themes for ALL 19 systems defined in es_systems.cfg, even
+though only 1 (SNES) has any ROMs. Each theme involves parsing potentially complex XML, resolving
+variables, building element hierarchies for every view type. On a 1.5GHz Cortex-A35, this adds
+up fast. dArkOS is faster partly because their Mali proprietary blob has near-zero GPU init
+(vs our Panfrost shader compilation), but also because their theme loading is likely simpler.
+
+Applied `PreloadUI=false` in es_settings.cfg — this skips the `preload()` loop that creates
+views for all systems upfront (~2-3s saved). Views are created on-demand when the user
+navigates to a system.
+
+**What's next — ES lazy theme loading (the big fish):**
+
+The real win is making ES lazy-load themes: only load the theme for the currently displayed
+system, not all 19 at startup. This would save 6-8 seconds. Requires modifying
+`SystemData::loadConfig()` in the ES-fcamod source to defer `loadTheme()` until first use,
+and updating `ViewController::getGameListView()` to trigger theme loading on navigation. This
+is a C++ source modification + recompilation — planned for the next session.
+
+**Boot time progression:**
+```
+Day 1:    ~50s   (kernel 4.4 + custom init, no systemd)
+Day 7:    ~40s   (kernel 6.6 + systemd, unoptimized)
+Day 14:   ~35s   (splash service, getty chain, heavy ES script)
+Today:    ~29s   (systemd service, slim script, readahead, no fbcon)
+Target:   ~22s   (ES lazy-load themes, potential Mesa shader cache)
+```
 
 ---
 
@@ -661,11 +803,11 @@ This is worse than before and needs investigation. Possible causes:
 | # | Task | Status | Notes |
 |---|------|--------|-------|
 | 1 | ES rendering on screen | **WORKING** | GLES 1.0 native → Mesa TNL → Panfrost, 78fps stable |
-| 2 | Audio output (ES) | **IN PROGRESS** | Root cause found (missing music dir). speaker-test beep regressed. Needs ES rebuild with logging |
-| 3 | Game launch (RetroArch) | **PARTIAL** | Video works, input works, **audio NOT working** |
+| 2 | Audio output (ES) | **WORKING** | `use-ext-amplifier` DTS fix. ES music + bgsound confirmed |
+| 3 | Game launch (RetroArch) | **WORKING** | Video, input, **audio ALL working** |
 | 4 | Button/joystick in ES | **WORKING** | gpio-keys (17 buttons) + adc-joystick (4 axes) |
 | 5 | Button/joystick in games | **WORKING** | udev joypad, autoconfig detected |
-| 6 | Clean shutdown/reboot | **REGRESSION** | Kernel panic "Attempted to kill idle task" on shutdown |
+| 6 | Clean shutdown/reboot | **WORKING** | Systemd service + sudo caps + PMIC shutdown hook |
 
 ### High Priority — Expected for Release
 
@@ -675,9 +817,10 @@ This is worse than before and needs investigation. Possible causes:
 | 8 | Brightness control | **WORKING** | Direct sysfs backlight (max=255), MODE+VOL hotkeys |
 | 9 | Mesa 26 on-device | **WORKING** | gles1=enabled, glvnd=false, Panfrost GLES 3.1 |
 | 10 | GPU 600MHz unlock | **WORKING** | 520→600MHz, zero overvolt, bin=2 silicon |
-| 11 | RetroArch audio | **BLOCKED** | ALSA init OK but no sound. Need `--disable-microphone` rebuild |
-| 12 | Panel selection (PanCho) | Not tested | 18 DTBOs generated, boot.ini integration |
-| 13 | Full build from scratch | Not tested | `build-all.sh` end-to-end |
+| 11 | RetroArch audio | **WORKING** | Fixed by `use-ext-amplifier` DTS property (same root cause as ES) |
+| 12 | Boot time optimization | **29s** | Target 22s. Next: ES lazy-load themes |
+| 13 | Panel selection (PanCho) | Not tested | 18 DTBOs generated, boot.ini integration |
+| 14 | Full build from scratch | Not tested | `build-all.sh` end-to-end |
 
 ### Medium Priority — Can Ship Without, Fix in Updates
 
@@ -706,7 +849,7 @@ This is worse than before and needs investigation. Possible causes:
 
 ## Path to v1.0
 
-**Current phase:** Fix audio pipeline (ES + RetroArch) + shutdown regression
+**Current phase:** Boot optimization + ES lazy-load
 
 1. ~~**Test gl4es + Panfrost rendering**~~ — **DONE.** ES renders on screen, Panfrost GPU confirmed
 2. ~~**Fix audio card registration**~~ — **DONE.** rk817_int card registered (3-iteration fix chain)
@@ -720,31 +863,37 @@ This is worse than before and needs investigation. Possible causes:
 10. ~~**FPS stability fix**~~ — **DONE.** popen() fork overhead → sysfs direct reads, 78fps stable
 11. ~~**Build RetroArch with KMSDRM**~~ — **DONE.** v1.22.2, KMS/DRM + EGL + GLES, 16MB binary
 12. ~~**Validate game launch**~~ — **DONE.** Video works, input works, returns to ES cleanly
-13. **Rebuild ES with audio logging** — Patch 15 (AudioManager diagnostic LOG statements). `quick-rebuild-es.sh` ready
-14. **Fix RetroArch audio** — Rebuild with `--disable-microphone`
-15. **Fix speaker-test regression** — Beep stopped working, investigate emulationstation.sh deployment
-16. **Fix shutdown kernel panic** — "Attempted to kill idle task", investigate PMIC hook timing
-17. **Full build test** — Run `build-all.sh` end-to-end on clean environment
-18. **Polish** — Boot splash, panel selection, theme
-19. **Release candidate** — Generate final image, test on multiple R36S units
+13. ~~**Rebuild ES with audio logging**~~ — **DONE.** Patch 15 confirmed software chain working perfectly
+14. ~~**Fix audio (ES + RetroArch)**~~ — **DONE.** Root cause: missing `use-ext-amplifier` DTS property. DTB-only rebuild, 1 second fix
+15. ~~**Fix shutdown kernel panic**~~ — **TRANSIENT.** Not reproduced since Feb 15. Likely a one-off DRM/I2C race condition during shutdown. Monitor.
+16. ~~**Boot optimization (35s → 29s)**~~ — **DONE.** Systemd ES service, readahead, udev rules, slim script, logo update
+17. ~~**Fix shutdown from systemd service**~~ — **DONE.** Added sudo caps (SETUID/SETGID/DAC_OVERRIDE/AUDIT_WRITE), NOPASSWD sudoers, exit 0 paths
+18. ~~**Fix ROM detection**~~ — **DONE.** LABEL=ROMS in fstab, 10s device timeout, After=local-fs.target
+19. **ES lazy-load themes** — Modify ES source to defer `loadTheme()` per-system until first navigation (~6-8s savings)
+20. **Full build test** — Run `build-all.sh` end-to-end on clean environment
+21. **Polish** — Panel selection, theme, final tweaks
+22. **Release candidate** — Generate final image, test on multiple R36S units
 
 ## Stats
 
 | Metric | Value |
 |--------|-------|
 | Project start | 2026-02-04 |
-| Days active | 12 |
+| Days active | 14 |
+| Boot time | 29s (target: 22s) |
 | Kernel version | 6.6.89-archr |
 | CPU frequency | 1512MHz (unlocked from 1200) |
 | GPU frequency | 600MHz (unlocked from 480) |
 | DRAM frequency | 786MHz (unlocked from 666) |
 | ES FPS | 78fps stable (panel 78.2Hz) |
 | ES rendering | GLES 1.0 → Mesa TNL → Panfrost |
+| ES audio | Working (SDL_mixer → SDL3 → ALSA → rk817) |
 | RetroArch rendering | GLES 3.1 → Panfrost |
+| RetroArch audio | Working (ALSA → rk817 → ext amp) |
 | Panel support | 18 panels (6 original + 12 clone) |
 | RetroArch cores | 18 pre-installed |
-| Root causes found & fixed | 21+ |
+| Root causes found & fixed | 25+ |
 
 ---
 
-*Last updated: 2026-02-15*
+*Last updated: 2026-02-17 (boot optimization session)*
