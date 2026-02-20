@@ -550,7 +550,7 @@ Each `popen()` = `fork()` → on ARM Cortex-A35, fork() costs **2-5ms per call**
   fallback in `DisplayPanelControl.cpp` — open/read/close, microseconds)
 - Patch 14: Polling intervals reduced: brightness 40→500ms, volume 40→200ms
 
-**Result: 78fps rock-solid stable!** User reaction: *"PERFEITO 78 FPS estável!"*
+**Result: 78fps rock-solid stable.**
 
 **Panel Discovery: 78.2Hz refresh rate (NOT 60Hz!)**
 
@@ -882,6 +882,300 @@ That should shave ~0.5s off kernel probe time.
 
 ---
 
+### 2026-02-19 — Day 16: Chasing the Seamless Boot, PanCho Retired
+
+Yesterday we figured out U-Boot was eating ~14 seconds. Today we attacked.
+
+**PanCho gets the axe: 29s → 26s**
+
+The PanCho panel selector had two `sleep 3` calls totaling 6 seconds of pure waste. The user
+decided to retire PanCho entirely — "a estratégia será outra" for multi-panel boot. We renamed
+PanCho.ini to .disabled. Boot dropped from 29s to 26s immediately. U-Boot now takes ~11s
+instead of ~14s, with the remaining time being hardware init (~3-4s) and loading the 40MB
+kernel Image (~4s).
+
+**The seamless splash research**
+
+In parallel with hardware testing, two deep research agents ran: one for boot splash
+persistence (how to keep the U-Boot logo visible through kernel boot), and one for drawing
+a progress bar on the framebuffer.
+
+The splash research uncovered something we should have caught earlier: the stock R36S DTBs
+include a `drm-logo@0` reserved-memory region and `logo-memory-region` property on the display
+subsystem — that's how the stock firmware has a seamless boot with no black flash. Our custom
+DTS was missing both. Without them, the Rockchip DRM driver calls
+`drm_aperture_remove_framebuffers()` and destroys the U-Boot logo, causing the black screen
+gap that our splash.service was trying to fill.
+
+**The fix: three changes, one kernel rebuild**
+
+1. **DTS: `reserved-memory` + `drm-logo@0`** — U-Boot writes the logo framebuffer address
+   into this node at runtime. The kernel's `rockchip_drm_show_logo()` reads it and preserves
+   the framebuffer through DRM initialization. No more black flash.
+
+2. **DTS: `&display_subsystem` + `logo-memory-region` + `route-dsi`** — Tells the kernel
+   which connector the logo is displayed on (DSI panel via vopb). Without the route, the
+   logo preservation code doesn't know where to display.
+
+3. **Kernel config: `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`** — This is the other
+   half of the puzzle. Even with the logo preserved through DRM init, fbcon would still
+   clear the framebuffer when it initializes. Deferred takeover makes fbcon wait until
+   actual text output happens. Since we boot with `quiet` and `console=ttyFIQ0` (serial),
+   fbcon never touches the framebuffer. Logo stays on screen from U-Boot all the way to ES.
+
+The expected result after rebuild: U-Boot logo.bmp appears → stays visible through kernel
+boot → stays visible through systemd → ES takes DRM master and replaces with its own UI.
+Zero black flashes. The only visual transition will be the ~16ms mode-set when SDL3 KMSDRM
+takes DRM master.
+
+**Progress bar: deferred**
+
+The progress bar research was thorough (custom C program ~100 lines, mmaps /dev/fb0, draws
+over the splash at specific coordinates, disappears naturally when ES takes DRM master).
+But with the seamless logo fix, a progress bar becomes less critical — the user already sees
+the logo throughout boot. We can add it later as polish.
+
+**boot-timing.service: Type=oneshot was the bug**
+
+Also discovered that our boot-timing.service was using `Type=oneshot`, which blocks
+`multi-user.target` until ExecStart completes (including the 15s sleep!). This meant
+`systemd-analyze` always reported "Bootup not yet finished" because the service itself
+was preventing systemd from ever marking boot as finished. Changed to `Type=simple`.
+
+**What's next**
+
+Kernel rebuild needed with drm-logo revert and config trim.
+
+---
+
+### 2026-02-19 (cont.) — drm-logo DEAD, Kernel 40MB → 18MB
+
+**The seamless splash dream dies**
+
+After deep analysis of `rockchip_drm_logo.c`, the drm-logo approach is confirmed dead
+for our U-Boot. The ODROID-Go U-Boot (2017.09) simply never fills the `drm-logo@0`
+reserved-memory `reg` property — it stays `<0 0 0 0>`. When the kernel's
+`init_loader_memory()` runs, `resource_size()` returns 0, function returns `-ENOMEM`.
+But here's the nasty part: `rockchip_clocks_loader_protect()` (an arch_initcall_sync)
+runs because our `route-dsi { status = "okay" }` exists, and it holds VOP/display clocks
+in a "protected" state. With the logo code bailing out, those clocks are left in an
+inconsistent state → SDL3 KMSDRM gets `ERROR: Could not restore CRTC`. The stock R36S
+firmware uses Rockchip's proprietary U-Boot which HAS the logo code. Our ODROID U-Boot
+doesn't and never will.
+
+**Reverted all drm-logo DTS changes** — removed `reserved-memory` block and
+`&display_subsystem` override. Kept `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`
+(harmless, prevents fbcon text during `quiet` boot).
+
+**The SIGPIPE bug — the real reason the kernel wasn't shrinking**
+
+Ran `build-kernel.sh` to rebuild with the reverted DTS. The GPU config warnings were
+back: "Panfrost GPU: NOT ENABLED", "Mali Midgard: STILL ENABLED". Investigated and found
+a beautiful bug:
+
+`build-kernel.sh` piped `merge_config.sh` output through `| grep | head -20` for display
+filtering. With our expanded config fragment (200+ entries), more than 20 "Value of CONFIG_X
+is redefined" messages were generated. After 20 lines, `head -20` exits → SIGPIPE cascades
+through `grep` to `merge_config.sh` → the script dies MID-LOOP → the `cp -T` that writes
+the merged .config NEVER RUNS → .config stays as the original defconfig.
+
+This means our config trim (16 categories, 200 disabled entries) was **never being applied
+to the kernel!** Every build was using the full defconfig with all the bloat.
+
+Fix: capture merge output to variable first (`MERGE_LOG=$(...)`), then filter for display.
+No pipe, no SIGPIPE.
+
+**The result: Image 40MB → 18MB!**
+
+With the config actually applied for the first time:
+- **Kernel Image: 40MB → 18MB** (55% reduction!)
+- **Modules: 30MB → 5.2MB** (83% reduction!)
+- Panfrost GPU: ENABLED (module) — Mali Midgard: disabled
+
+The 16 categories of trim removed: PCI/NVMe/SATA, Debug/Ftrace, Rockchip MPP for other SoCs,
+Camera/ISP/DVB, Display HDMI/DP/LVDS, Ethernet/CAN, PHY for other SoCs, MTD, XFS/NFS/BTRFS,
+Audio codecs (kept only RK817), Touchscreen, SoC CPU configs (kept only PX30), BCMDHD, and
+miscellaneous bloat (USB-C TCPM, DWC3, EFI, ramdisk, etc.).
+
+**Deployed to SD card.** New Image (18MB), new DTB (104K, drm-logo reverted), new modules
+(5.2MB). Old Image backed up as Image.bak. `rg351mp-kernel.dtb` verified preserved (lesson
+learned the hard way on day 14).
+
+**What this means for boot time:**
+The 18MB Image loads in ~1.8s from SD card (vs ~4s for 40MB) — that's ~2.2s saved in U-Boot
+alone! Combined with PanCho removal (-3.5s) and any future bootdelay=0 (-1.0s), U-Boot could
+drop from 14s to ~7-8s. Total boot from power-on to ES visible could hit ~22s.
+
+**Hardware test needed** — the SD card is ready, just needs to be plugged in and booted.
+
+---
+
+### 2026-02-19 (cont.) — Splash Graveyard, Boot Confirmed at 19s
+
+**Three splash approaches tried. Three failures.**
+
+This session was supposed to be the "seamless boot" session. We had the `archr-splash.c` binary
+ready (a minimal C program that reads a BMP and blits it to `/dev/fb0`), and the plan was to
+show the logo via a systemd service early enough that it would persist until ES takes DRM master.
+
+**Attempt 1: archr-splash.service (fbcon disabled)**
+
+Disabled `CONFIG_FRAMEBUFFER_CONSOLE` in the kernel to prevent fbcon from ever touching the
+framebuffer. Deployed `archr-splash` binary + service (WantedBy=sysinit.target). Rebuilt kernel,
+deployed everything. Booted — splash didn't persist. Something else cleared fb0 between the
+splash write and ES startup. Removed the service.
+
+**Attempt 2: ROCKNIX approach (fbcon enabled, gettys masked)**
+
+Researched how ROCKNIX does it. Their trick: keep `FRAMEBUFFER_CONSOLE=y` but remove ALL getty
+services and disable `DEFERRED_TAKEOVER`. The splash persists because no getty writes to the
+console. Applied this: re-enabled fbcon, masked 6 getty services + getty-generator, set logind
+`NAutoVTs=0`, disabled DEFERRED_TAKEOVER. Rebuilt kernel, deployed. Boot — "Não funcionou."
+The archr-splash service (now with ConditionPathExists=/dev/fb0) never ran.
+
+Then began 30 minutes of increasingly desperate diagnostic service iterations: external scripts
+logging to /boot (FAT32), to /tmp, to /var/log. Removed ConditionPathExists. Added
+After=local-fs.target. Changed to inline bash -c. Added StandardOutput/StandardError. None
+produced any log output. The external script version of archr-boot-setup.service simply does
+not execute — the inline bash -c version works, but external scripts silently don't run.
+Root cause never determined. After 30 minutes of debugging without results, decided to abandon
+this approach.
+
+**Attempt 3: splash in emulationstation.sh**
+
+Considered calling archr-splash from emulationstation.sh, but this would add latency to the
+ES startup path. Decided against — reverted to U-Boot-only boot.
+
+**The revert**
+
+Removed all splash artifacts: archr-splash binary, archr-splash.service, splash-debug.sh,
+splash-diag.sh. Restored emulationstation.sh from repo. Restored archr-boot-setup.service to
+original inline version.
+
+**The collateral damage: audio + brightness persistence broke**
+
+After the revert, volume and brightness were resetting to defaults on every reboot.
+Root cause: the getty masks and logind.conf changes from Attempt 2 were still on the SD card.
+Masking getty.target and all getty services + setting NAutoVTs=0 broke session management,
+preventing the hotkey daemon from properly saving state.
+
+Also found a secondary bug: `emulationstation.sh` always hardcoded `amixer -q sset 'DAC' 80%`
+regardless of saved volume in `~/.config/archr/volume`.
+
+**Fixes:**
+- Removed all 7 getty mask symlinks (`/etc/systemd/system/getty@.service` → /dev/null, etc.)
+- Restored `/etc/systemd/logind.conf` to default `[Login]` (empty)
+- Fixed `emulationstation.sh` to read saved volume:
+  ```bash
+  VOL_SAVE="$HOME/.config/archr/volume"
+  if [ -f "$VOL_SAVE" ]; then
+      amixer -q sset 'DAC' "$(cat "$VOL_SAVE")%" 2>/dev/null
+  else
+      amixer -q sset 'DAC' 80% 2>/dev/null
+  fi
+  ```
+
+Both confirmed working after fixes.
+
+**The good news: 18MB kernel BOOTS! 19 seconds!**
+
+Boot measured at **19 seconds on first power-on**, 24 seconds on
+second boot. The 18MB kernel is confirmed working. Boot timing data from `/boot/boot-timing.txt`:
+
+```
+Kernel:           2.348s
+Userspace:        7.679s
+Total (systemd):  10.027s
+ES script start:  9.74s uptime
+ES UI ready:     ~13.1s uptime
+```
+
+That means U-Boot is taking ~6-7s (19s - 13.1s uptime). Down from ~14s before PanCho removal
+and ~11s with PanCho removed but 40MB Image. The 18MB Image shaved another ~2s off U-Boot.
+The 24s second boot is likely the charge-animation code in U-Boot checking battery state.
+
+Top systemd blame: `dev-mmcblk1p2.device` (3.8s), `systemd-udev-trigger` (1.6s),
+`zram-swap` (0.9s).
+
+**Current boot breakdown (confirmed):**
+```
+U-Boot:    ~6-7s   (DDR, PMIC, SD, display, 18MB Image load)
+Kernel:    ~2.3s
+systemd:   ~7.7s   (SD device detection 3.8s is the bottleneck)
+ES script: ~0.2s
+ES binary: ~2.5s
+TOTAL:     ~19s first boot, ~24s with charge-animation
+```
+
+**Splash status: DEAD.** Three approaches tried, none worked with ODROID U-Boot. The brief
+blackout during DRM init (~16ms mode-set) will stay for now. User explicitly chose to move on.
+Future option: investigate Plymouth or accept the current boot experience.
+
+**Kernel config note:** The config fragment currently has `FRAMEBUFFER_CONSOLE=y` and
+`# CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER is not set` (from Attempt 2). This is
+harmless — fbcon is active but with `console=ttyFIQ0` and `quiet`, no text appears on screen.
+
+---
+
+### 2026-02-19 (cont.) — Plymouth: The Fourth Splash Attempt (also dead)
+
+After marking splash as "dead" earlier today, we circled back to try Plymouth — the proper
+Arch Linux boot splash daemon. The theory: Plymouth uses DRM/KMS natively, maintains DRM
+master, has systemd integration, and is battle-tested. If anything could give us seamless
+boot, it would be this.
+
+**Plymouth on embedded ARM: nothing works out of the box**
+
+The rabbit hole was deep. Plymouth's systemd services (`plymouth-start.service`,
+`plymouth-quit.service`) have NO `[Install]` section — they're designed for initramfs hooks,
+not `systemctl enable`. Manual symlinks into `sysinit.target.wants/` were required.
+
+Then `--attach-to-session` (the default) expected a session from an initramfs Plymouth instance
+that doesn't exist. Switched to `--no-daemon` with `Type=simple`. Then the daemon hung at
+`ply_get_primary_kernel: opening /proc/consoles` — with only `console=ttyFIQ0` (serial),
+Plymouth couldn't find a VT to render on. Added `console=tty1` to the cmdline.
+
+Then the watermark image appeared but was rotated 90 degrees — because the panel is 480x640
+portrait and VOP does the rotation at scanout. Plymouth's `DeviceRotation` config had zero
+effect. Had to pre-rotate the watermark image. Then it was off-center because the spinner
+theme's `WatermarkVerticalAlignment=.96` maps to the wrong side after VOP rotation. Changed
+to `.5`.
+
+**Plymouth actually worked!** The image appeared correctly for ~2 seconds before ES took over.
+But there was a ~3 second black gap between U-Boot logo and Plymouth.
+
+**Kernel rebuild with DEFERRED_TAKEOVER**
+
+Rebuilt the kernel with `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`. Deployed the 18MB
+Image to the SD card. Still black gap. Even disabled Plymouth entirely (kept only
+`console=ttyFIQ0`) — still black gap.
+
+**Root cause:** The rockchip-drm driver allocates a new zero-filled GEM buffer during
+`rockchip_drm_fbdev_setup()`. This zeros fb0 regardless of DEFERRED_TAKEOVER (which only
+controls fbcon text). The DRM driver probe itself clears whatever U-Boot had painted.
+
+Plymouth adds ANOTHER modeset on top — extra gap, not less. The user correctly pointed out
+that ROCKNIX manages to keep the logo visible, but ROCKNIX likely uses Rockchip's proprietary
+U-Boot which has the `drm-logo` framebuffer preservation code that our ODROID U-Boot lacks.
+
+**Verdict: splash is truly dead**
+
+Four approaches tried over three days:
+1. `archr-splash.c` + systemd service → service silently fails to run external scripts
+2. ROCKNIX approach (getty masking) → broke audio/brightness persistence
+3. `drm-logo` DTS reserved-memory → ODROID U-Boot never fills reg property
+4. Plymouth DRM splash → works but introduces its own black gap
+
+Removed all Plymouth references from build scripts (`build-rootfs.sh`, `build-image.sh`,
+`config/boot.ini`, `scripts/emulationstation.sh`). Created `cleanup-plymouth-sd.sh` to
+remove Plymouth remnants from the SD card (services, config, debug logs, cmdline params,
+fstab tmpfs restore).
+
+The boot experience stays as-is: U-Boot logo (6-7s) → brief black (~2s DRM init) → ES UI.
+Not perfect, but functional. Moving on.
+
+---
+
 ## What's Left for v1.0 Stable
 
 ### Critical — Must Work Before Release
@@ -904,7 +1198,7 @@ That should shave ~0.5s off kernel probe time.
 | 9 | Mesa 26 on-device | **WORKING** | gles1=enabled, glvnd=false, Panfrost GLES 3.1 |
 | 10 | GPU 600MHz unlock | **WORKING** | 520→600MHz, zero overvolt, bin=2 silicon |
 | 11 | RetroArch audio | **WORKING** | Fixed by `use-ext-amplifier` DTS property (same root cause as ES) |
-| 12 | Boot time optimization | **29s** | ES binary 2.5s (was 17s). Bottleneck now pre-ES (U-Boot?) |
+| 12 | Boot time optimization | **19s confirmed** | 18MB kernel booting, U-Boot ~6-7s, ES ready @13.1s uptime |
 | 13 | Panel selection (PanCho) | Not tested | 18 DTBOs generated, boot.ini integration |
 | 14 | Full build from scratch | Not tested | `build-all.sh` end-to-end |
 
@@ -935,7 +1229,7 @@ That should shave ~0.5s off kernel probe time.
 
 ## Path to v1.0
 
-**Current phase:** Boot profiling — identify U-Boot bottleneck
+**Current phase:** Stabilization — 18MB kernel confirmed booting (19s), all core features working
 
 1. ~~**Test gl4es + Panfrost rendering**~~ — **DONE.** ES renders on screen, Panfrost GPU confirmed
 2. ~~**Fix audio card registration**~~ — **DONE.** rk817_int card registered (3-iteration fix chain)
@@ -957,20 +1251,24 @@ That should shave ~0.5s off kernel probe time.
 18. ~~**Fix ROM detection**~~ — **DONE.** LABEL=ROMS in fstab, 10s device timeout
 19. ~~**ES source optimization (21 patches)**~~ — **DONE.** ES binary 17s → 2.5s (7x faster). ThreadPool VSync, skip empty dirs, MameNames lazy
 20. ~~**systemd service cleanup**~~ — **DONE.** getty disabled, dependency chain fixed, preload removed
-21. **Boot profiling: read es-timeline.txt** — Will reveal U-Boot time (est. ~14s)
-22. **Boot: investigate U-Boot** — If >10s: bootdelay, PanCho timeout, SD speed
-23. **Boot: kernel rebuild** — CIF/RAID disabled in config, pending rebuild (~0.5s savings)
-24. **Full build test** — Run `build-all.sh` end-to-end on clean environment
-25. **Polish** — Panel selection, VT flash fix, theme, final tweaks
-26. **Release candidate** — Generate final image, test on multiple R36S units
+21. ~~**Boot profiling: read es-timeline.txt**~~ — **DONE.** U-Boot ~11s (was ~14s pre-PanCho)
+22. ~~**Boot: investigate U-Boot**~~ — **DONE.** PanCho removed (-3s), 26s measured
+23. ~~**Seamless boot splash DTS**~~ — **FAILED + REVERTED.** drm-logo incompatible with ODROID U-Boot (never fills reg property)
+24. ~~**Kernel config trim**~~ — **DONE.** 40MB → 18MB Image, 30MB → 5.2MB modules, 16 categories trimmed
+25. ~~**Kernel rebuild + deploy**~~ — **DONE.** DTS drm-logo reverted + config trim. Deployed to SD card
+26. ~~**Boot hardware test**~~ — **DONE.** 18MB kernel boots, 19s first boot confirmed
+27. **Full build test** — Run `build-all.sh` end-to-end on clean environment
+26. **Polish** — Panel selection, VT flash fix, theme, progress bar, final tweaks
+27. **Release candidate** — Generate final image, test on multiple R36S units
 
 ## Stats
 
 | Metric | Value |
 |--------|-------|
 | Project start | 2026-02-04 |
-| Days active | 15 |
-| Boot time | 29s (ES=2.5s, bottleneck=pre-ES) |
+| Days active | 16 |
+| Boot time | **19s** first boot (confirmed), 24s second boot (charge-animation) |
+| Kernel Image size | 18MB (was 40MB, -55%) |
 | Kernel version | 6.6.89-archr |
 | CPU frequency | 1512MHz (unlocked from 1200) |
 | GPU frequency | 600MHz (unlocked from 480) |
@@ -986,4 +1284,4 @@ That should shave ~0.5s off kernel probe time.
 
 ---
 
-*Last updated: 2026-02-18 (ES 7x faster, U-Boot mystery)*
+*Last updated: 2026-02-19 (boot 19s confirmed, Plymouth also dead — 4 splash approaches tried, all failed with ODROID U-Boot)*
